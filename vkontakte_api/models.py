@@ -21,6 +21,18 @@ class VkontakteContentError(Exception):
     pass
 
 
+class VkontakteBaseCRUDManager(models.Manager):
+
+    def create(self, **kwargs):
+        commit_remote = kwargs.get('commit_remote', False)
+        if commit_remote:
+            vk_obj = self.model()
+            vk_obj.__dict__.update(kwargs)
+            vk_obj.save(commit_remote=commit_remote)
+            return vk_obj
+        return super(VkontakteBaseCRUDManager, self).create(**kwargs)
+
+
 class VkontakteManager(models.Manager):
     '''
     Vkontakte Ads API Manager for RESTful CRUD operations
@@ -346,7 +358,7 @@ class VkontakteCRUDModel(VkontakteModel):
         '''
         commit_remote = kwargs.get('commit_remote', commit_remote)
         if commit_remote:
-            if not self.id and not self.fetched or not self.remote_id:
+            if not self.id and not self.fetched:
                 self.create_remote(**kwargs)
             elif self.id and self.fields_changed:
                 self.update_remote(**kwargs)
