@@ -356,7 +356,6 @@ class VkontakteCRUDModel(VkontakteModel):
         '''
         Update remote version of object before saving if data is different
         '''
-        commit_remote = kwargs.get('commit_remote', commit_remote)
         if commit_remote:
             if not self.id and not self.fetched:
                 self.create_remote(**kwargs)
