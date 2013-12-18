@@ -4,6 +4,7 @@ from django.db import models
 from django.core.exceptions import ImproperlyConfigured
 from django.db.models.fields import FieldDoesNotExist
 from django.db.models.query import QuerySet
+from django.conf import settings
 from datetime import datetime, date
 from vkontakte_api.utils import api_call, VkontakteError
 from vkontakte_api import fields
@@ -12,12 +13,18 @@ import re
 
 log = logging.getLogger('vkontakte_api')
 
+COMMIT_REMOTE = getattr(settings, 'VKONTAKTE_API_COMMIT_REMOTE', True)
+
 
 class VkontakteDeniedAccessError(Exception):
     pass
 
 
 class VkontakteContentError(Exception):
+    pass
+
+
+class VkontakteParseError(Exception):
     pass
 
 
@@ -216,6 +223,7 @@ class VkontakteModel(models.Model):
         abstract = True
 
     remote_pk_field = 'id'
+    remote_pk_local_field = 'remote_id'
     methods_access_tag = ''
     methods_namespace = ''
 
@@ -236,7 +244,7 @@ class VkontakteModel(models.Model):
         '''
         for key, value in response.items():
             if key == self.remote_pk_field:
-                key = 'remote_id'
+                key = self.remote_pk_local_field
                 value = int(value)
 
             try:
@@ -269,8 +277,14 @@ class VkontakteModel(models.Model):
                     value = None
 
             elif isinstance(field, models.OneToOneField) and value:
-                rel_instance = field.rel.to()
-                rel_instance.parse(dict(value))
+                rel_class = field.rel.to
+                if isinstance(value, int):
+                    try:
+                        rel_instance = rel_class.objects.get(pk=value)
+                    except rel_class.DoesNotExist:
+                        raise VkontakteParseError("OneToOne relation of model %s (PK=%s) does not exist" % (rel_class.__name__, value))
+                else:
+                    rel_instance = rel_class().parse(dict(value))
                 value = rel_instance
 
             if isinstance(field, (fields.CommaSeparatedCharField, models.CommaSeparatedIntegerField)) and isinstance(value, list):
@@ -293,43 +307,6 @@ class VkontakteModel(models.Model):
         if self.likes_type is None:
             raise ImproperlyConfigured("'likes_type' attribute should be specified")
 
-        # type
-        # тип Like-объекта. Подробнее о типах объектов можно узнать на странице Список типов Like-объектов.
-        kwargs['type'] = self.likes_type
-        # owner_id
-        # идентификатор владельца Like-объекта (id пользователя или id приложения). Если параметр type равен sitepage, то в качестве owner_id необходимо передавать id приложения. Если параметр не задан, то считается, что он равен либо идентификатору текущего пользователя, либо идентификатору текущего приложения (если type равен sitepage).
-        kwargs['owner_id'] = owner_id
-        # item_id
-        # идентификатор Like-объекта. Если type равен sitepage, то параметр item_id может содержать значение параметра page_id, используемый при инициализации виджета «Мне нравится».
-        kwargs['item_id'] = item_id
-        # page_url
-        # url страницы, на которой установлен виджет «Мне нравится». Используется вместо параметра item_id.
-
-        # filter
-        # указывает, следует ли вернуть всех пользователей, добавивших объект в список "Мне нравится" или только тех, которые рассказали о нем друзьям. Параметр может принимать следующие значения:
-        # likes – возвращать всех пользователей
-        # copies – возвращать только пользователей, рассказавших об объекте друзьям
-        # По умолчанию возвращаются все пользователи.
-        kwargs['filter'] = filter
-        # friends_only
-        # указывает, необходимо ли возвращать только пользователей, которые являются друзьями текущего пользователя. Параметр может принимать следующие значения:
-        # 0 – возвращать всех пользователей в порядке убывания времени добавления объекта
-        # 1 – возвращать только друзей текущего пользователя в порядке убывания времени добавления объекта
-        # Если метод был вызван без авторизации или параметр не был задан, то считается, что он равен 0.
-        kwargs['friends_only'] = 0
-        # offset
-        # смещение, относительно начала списка, для выборки определенного подмножества. Если параметр не задан, то считается, что он равен 0.
-        kwargs['offset'] = int(offset)
-        # count
-        # количество возвращаемых идентификаторов пользователей.
-        # Если параметр не задан, то считается, что он равен 100, если не задан параметр friends_only, в противном случае 10.
-        # Максимальное значение параметра 1000, если не задан параметр friends_only, в противном случае 100.
-        kwargs['count'] = int(count)
-
-        response = api_call('likes.getList', **kwargs)
-        return response['users']
-
-
 class VkontakteIDModel(VkontakteModel):
     class Meta:
         abstract = True
@@ -341,12 +318,28 @@ class VkontakteIDModel(VkontakteModel):
         return self.slug_prefix + str(self.remote_id)
 
 
-class VkontakteCRUDModel(VkontakteModel):
+class VkontaktePKModel(VkontakteModel):
     class Meta:
         abstract = True
 
-    archived = models.BooleanField(u'В архиве', default=False)
+    remote_id = models.BigIntegerField(u'ID', help_text=u'Уникальный идентификатор', primary_key=True)
+
+    @property
+    def slug(self):
+        return self.slug_prefix + str(self.remote_id)
+
+
+class VkontakteCRUDModel(models.Model):
+    class Meta:
+        abstract = True
+
+    # list of required number of fields for updating model remotely
+    fields_required_for_update = []
+
+    # flag should we update model remotely on save() and delete() methods
     _commit_remote = True
+
+    archived = models.BooleanField(u'В архиве', default=False)
 
     def __init__(self, *args, **kwargs):
         self._commit_remote = kwargs.pop('commit_remote', self._commit_remote)
@@ -356,10 +349,11 @@ class VkontakteCRUDModel(VkontakteModel):
         '''
         Update remote version of object before saving if data is different
         '''
-        if commit_remote:
-            if not self.id and not self.fetched:
+        commit_remote = commit_remote if commit_remote is not None else self._commit_remote
+        if commit_remote and COMMIT_REMOTE:
+            if not self.pk and not self.fetched:
                 self.create_remote(**kwargs)
-            elif self.id and self.fields_changed:
+            elif self.pk and self.fields_changed:
                 self.update_remote(**kwargs)
         super(VkontakteCRUDModel, self).save(*args, **kwargs)
 
@@ -371,7 +365,8 @@ class VkontakteCRUDModel(VkontakteModel):
                 % (self._meta.object_name, self.remote_id))
 
     def update_remote(self, **kwargs):
-        params = self.prepare_update_params(**kwargs)
+        params = self.prepare_update_params_distinct(**kwargs)
+        # sometimes response contains 1, sometimes remote_id
         response = type(self).remote.api_call(method='update', **params)
         if not response:
             message = "Error response '%s' while saving remote %s with ID %s and data '%s'" \
@@ -385,6 +380,17 @@ class VkontakteCRUDModel(VkontakteModel):
     def fields_changed(self):
         old = type(self).objects.get(remote_id=self.remote_id)
         return old.__dict__ != self.__dict__
+
+    def prepare_update_params_distinct(self):
+        '''
+        Return dict with distinct set of fields for update
+        '''
+        old = type(self).objects.get(remote_id=self.remote_id)
+        fields_new = self.prepare_update_params().items()
+        fields_old = old.prepare_update_params().items()
+        fields = dict(set(fields_new).difference(set(fields_old)))
+        fields.update(dict([(k,v) for k,v in fields_new if k in self.fields_required_for_update]))
+        return fields
 
     @abstractmethod
     def prepare_create_params(self, **kwargs):
@@ -426,18 +432,19 @@ class VkontakteCRUDModel(VkontakteModel):
         """
         raise NotImplementedError
 
-    def delete(self, commit_remote=True, *args, **kwargs):
+    def delete(self, commit_remote=None, *args, **kwargs):
         if not self.archived:
             self.archive(commit_remote)
 
-    def restore(self, commit_remote=True, *args, **kwargs):
+    def restore(self, commit_remote=None, *args, **kwargs):
         if self.archived:
             self.archive(commit_remote, restore=True)
 
-    def archive(self, commit_remote=True, restore=False):
+    def archive(self, commit_remote=None, restore=False):
         '''
         Archive or delete objects remotely and mark it archived localy
         '''
+        commit_remote = commit_remote if commit_remote is not None else self._commit_remote
         if commit_remote and self.remote_id:
             method = 'delete' if not restore else 'restore'
             params = self.prepare_delete_restore_params()
